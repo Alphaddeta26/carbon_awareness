@@ -1,46 +1,139 @@
 const { createClient } = require('redis');
 require('dotenv').config();
 
-const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
-const redisClient = createClient({ url: redisUrl });
+const redisUrl = process.env.REDIS_URL;
+let redisClient;
+let useMock = false;
 
-redisClient.on('error', (err) => console.error('[Redis Client Error]', err));
-redisClient.on('connect', () => console.log('[Redis Client] Connected to Redis server.'));
+// Mock In-Memory Store
+const mockData = {
+  lists: {},       // for rate limiting lists and queues
+  leaderboard: []  // for ZSET leaderboard [{ value: username, score: number }]
+};
 
-(async () => {
-  try {
-    await redisClient.connect();
-  } catch (err) {
-    console.error('[Redis Connection Error] Failed to connect:', err.message);
+const listeners = {};
+
+if (redisUrl) {
+  redisClient = createClient({ url: redisUrl });
+  redisClient.on('error', (err) => {
+    console.warn('[Redis Client Warning] Connection failed, switching to in-memory mock.', err.message);
+    useMock = true;
+  });
+  
+  (async () => {
+    try {
+      await redisClient.connect();
+    } catch (err) {
+      console.warn('[Redis Connection Warning] Could not connect. Using local in-memory fallback.');
+      useMock = true;
+    }
+  })();
+} else {
+  console.log('[Redis Config] No REDIS_URL environment variable set. Running in-memory mock mode.');
+  useMock = true;
+}
+
+// --------------------------------------------------------------------------
+// MOCK REDIS FUNCTIONS
+// --------------------------------------------------------------------------
+const mockRedis = {
+  // Sliding window list logic
+  multi: () => {
+    const operations = [];
+    return {
+      lPush: (key, val) => {
+        operations.push(() => {
+          if (!mockData.lists[key]) mockData.lists[key] = [];
+          mockData.lists[key].unshift(val);
+        });
+      },
+      lTrim: (key, start, end) => {
+        operations.push(() => {
+          if (mockData.lists[key]) {
+            mockData.lists[key] = mockData.lists[key].slice(start, end + 1);
+          }
+        });
+      },
+      expire: () => {
+        // Mock expire does nothing in memory
+      },
+      exec: async () => {
+        operations.forEach(op => op());
+        return [1, 'OK'];
+      }
+    };
+  },
+  lRange: async (key, start, end) => {
+    const list = mockData.lists[key] || [];
+    return end === -1 ? list.slice(start) : list.slice(start, end + 1);
+  },
+  // Queue Push & Pop Mocks
+  rPush: async (key, val) => {
+    if (!mockData.lists[key]) mockData.lists[key] = [];
+    mockData.lists[key].push(val);
+    
+    // Trigger any waiting blPop listener
+    if (listeners[key] && listeners[key].length > 0) {
+      const cb = listeners[key].shift();
+      cb();
+    }
+    return 1;
+  },
+  blPop: async (key, timeout) => {
+    if (mockData.lists[key] && mockData.lists[key].length > 0) {
+      const element = mockData.lists[key].shift();
+      return { key, element };
+    }
+    
+    // Return promise that resolves once a value is pushed via rPush
+    return new Promise((resolve) => {
+      if (!listeners[key]) listeners[key] = [];
+      listeners[key].push(() => {
+        const element = mockData.lists[key].shift();
+        resolve({ key, element });
+      });
+    });
+  },
+  // Sorted Set Leaderboard logic
+  zAdd: async (key, item) => {
+    const idx = mockData.leaderboard.findIndex(x => x.value === item.value);
+    if (idx !== -1) {
+      mockData.leaderboard[idx].score = item.score;
+    } else {
+      mockData.leaderboard.push({ value: item.value, score: item.score });
+    }
+    mockData.leaderboard.sort((a, b) => b.score - a.score);
+  },
+  zRangeWithScores: async (key, start, end, options) => {
+    const list = [...mockData.leaderboard];
+    const sliced = list.slice(start, end + 1);
+    return sliced;
   }
-})();
+};
 
 /**
- * Sliding Window Rate Limiting Middleware using Redis lists.
- * Allows max 50 requests per 60 seconds per IP address.
+ * Sliding Window Rate Limiting Middleware.
+ * Allows max 50 requests per 60 seconds per IP.
  */
 async function rateLimiter(req, res, next) {
   const ip = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
   const key = `rate_limit:${ip}`;
   const now = Date.now();
-  const windowMs = 60000; // 60 seconds
-  const maxRequests = 50;  // Limit
+  const windowMs = 60000;
+  const maxRequests = 50;
 
   try {
-    // 1. Remove timestamps older than window limit
+    const client = useMock ? mockRedis : redisClient;
     const minTimestamp = now - windowMs;
-    // We fetch current list, filter it, and save it back using multi/transaction
-    const multi = redisClient.multi();
-    multi.lPush(key, now.toString());
-    multi.lTrim(key, 0, maxRequests + 5); // Keep list size under control
-    multi.expire(key, 65); // Expire key after window
-    const [pushResult, trimResult] = await multi.exec();
 
-    // 2. Fetch list values to calculate hits within sliding window
-    const timestamps = await redisClient.lRange(key, 0, -1);
+    const multi = client.multi();
+    multi.lPush(key, now.toString());
+    multi.lTrim(key, 0, maxRequests + 5);
+    await multi.exec();
+
+    const timestamps = await client.lRange(key, 0, -1);
     const validTimestamps = timestamps.filter(t => parseInt(t) > minTimestamp);
 
-    // If hits within window exceed max limit, return HTTP 429
     if (validTimestamps.length > maxRequests) {
       console.warn(`[Rate Limiter] Rate limit exceeded for IP: ${ip}`);
       return res.status(429).json({
@@ -52,36 +145,33 @@ async function rateLimiter(req, res, next) {
     next();
   } catch (err) {
     console.error('[Rate Limiter Error]', err.message);
-    // On cache failure, allow requests to fail-open so app isn't bricked
     next();
   }
 }
 
 /**
- * Adds or updates a user's emission reduction savings score on the global leaderboard.
- * @param {string} username - User account name
- * @param {number} carbonSaved - Net kg CO2 saved
+ * Adds or updates user reduction score on leaderboard.
  */
 async function updateLeaderboardScore(username, carbonSaved) {
   try {
-    // Sorted set (ZADD) adds/updates the score for member username
-    await redisClient.zAdd('leaderboard:global', {
+    const client = useMock ? mockRedis : redisClient;
+    await client.zAdd('leaderboard:global', {
       score: parseFloat(carbonSaved),
       value: username
     });
-    console.log(`[Redis Leaderboard] Updated score for "${username}" to ${carbonSaved} kg`);
+    console.log(`[Leaderboard] Updated score for "${username}" to ${carbonSaved} kg`);
   } catch (err) {
-    console.error('[Redis Leaderboard Error] Failed to update score:', err.message);
+    console.error('[Leaderboard Error] Failed to update score:', err.message);
   }
 }
 
 /**
- * Fetches top 10 carbon reducing champions from Redis Sorted Set.
- * @returns {Promise<Array>} List of user objects with username and points
+ * Fetches top 10 carbon reducing champions.
  */
 async function getTopLeaderboard() {
   try {
-    const list = await redisClient.zRangeWithScores('leaderboard:global', 0, 9, {
+    const client = useMock ? mockRedis : redisClient;
+    const list = await client.zRangeWithScores('leaderboard:global', 0, 9, {
       REV: true
     });
     return list.map(item => ({
@@ -89,7 +179,7 @@ async function getTopLeaderboard() {
       score: item.score
     }));
   } catch (err) {
-    console.error('[Redis Leaderboard Error] Failed to fetch leaderboard:', err.message);
+    console.error('[Leaderboard Error] Failed to fetch leaderboard:', err.message);
     return [];
   }
 }

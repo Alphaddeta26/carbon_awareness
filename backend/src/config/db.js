@@ -2,42 +2,123 @@ const { Pool } = require('pg');
 const ConsistentHashRing = require('./consistent_hashing');
 require('dotenv').config();
 
-// Initialize connection pools for both database shards
-const poolShard1 = new Pool({
-  connectionString: process.env.DB_SHARD_1_URL || 'postgres://postgres:postgrespass@localhost:5433/carbon_shard1'
-});
+let useMock = false;
+let shardMap = {};
+let shards = [];
+let ring;
 
-const poolShard2 = new Pool({
-  connectionString: process.env.DB_SHARD_2_URL || 'postgres://postgres:postgrespass@localhost:5434/carbon_shard2'
-});
-
-const shardMap = {
-  'shard-1': poolShard1,
-  'shard-2': poolShard2
+// Mock In-Memory DB Store
+const mockDb = {
+  users: [],
+  footprints: []
 };
 
-const shards = [poolShard1, poolShard2];
+const dbShard1Url = process.env.DB_SHARD_1_URL;
+const dbShard2Url = process.env.DB_SHARD_2_URL;
 
-// Instantiate consistent hash ring with the database shard identifiers
-const ring = new ConsistentHashRing(['shard-1', 'shard-2'], 100);
+if (dbShard1Url && dbShard2Url) {
+  const poolShard1 = new Pool({ connectionString: dbShard1Url });
+  const poolShard2 = new Pool({ connectionString: dbShard2Url });
+
+  shardMap = {
+    'shard-1': poolShard1,
+    'shard-2': poolShard2
+  };
+
+  shards = [poolShard1, poolShard2];
+  ring = new ConsistentHashRing(['shard-1', 'shard-2'], 100);
+
+  // Connection check
+  poolShard1.on('error', (err) => {
+    console.error('[DB Shard 1 Error]', err.message);
+    useMock = true;
+  });
+  poolShard2.on('error', (err) => {
+    console.error('[DB Shard 2 Error]', err.message);
+    useMock = true;
+  });
+} else {
+  console.log('[DB Sharder] No DB_SHARD_1_URL or DB_SHARD_2_URL environment variables set. Running in-memory mock database mode.');
+  useMock = true;
+}
 
 /**
- * Routes a User ID (or username) to a physical database pool using the Consistent Hash Ring.
- * @param {string} key - Routing key (username or user UUID)
- * @returns {Pool} Target PostgreSQL pool
+ * Mock SQL Query Engine executing query templates against in-memory lists.
+ */
+function queryMock(text, params) {
+  const normalizedText = text.replace(/\s+/g, ' ').trim();
+  console.log(`[DB Mock Engine] Executing: ${normalizedText}`);
+
+  // Query 1: SELECT * FROM users WHERE username = $1
+  if (normalizedText.includes('SELECT * FROM users WHERE username =')) {
+    const username = params[0];
+    const match = mockDb.users.filter(u => u.username === username);
+    return { rows: match };
+  }
+
+  // Query 2: INSERT INTO users (id, username, password, region) VALUES ($1, $2, $3, $4)
+  if (normalizedText.startsWith('INSERT INTO users')) {
+    const newUser = {
+      id: params[0],
+      username: params[1],
+      password: params[2],
+      region: params[3] || 'Global',
+      created_at: new Date()
+    };
+    mockDb.users.push(newUser);
+    return { rows: [] };
+  }
+
+  // Query 3: INSERT INTO footprints (user_id, travel_score, energy_score, food_score, waste_score, total_footprint)
+  if (normalizedText.startsWith('INSERT INTO footprints')) {
+    const newLog = {
+      id: mockDb.footprints.length + 1,
+      user_id: params[0],
+      travel_score: parseFloat(params[1]),
+      energy_score: parseFloat(params[2]),
+      food_score: parseFloat(params[3]),
+      waste_score: parseFloat(params[4]),
+      total_footprint: parseFloat(params[5]),
+      created_at: new Date()
+    };
+    mockDb.footprints.push(newLog);
+    return { rows: [] };
+  }
+
+  // Query 4 & 5: SELECT history/total_footprints FROM footprints
+  if (normalizedText.includes('FROM footprints WHERE user_id =')) {
+    const userId = params[0];
+    const matchLogs = mockDb.footprints
+      .filter(f => f.user_id === userId)
+      .sort((a, b) => b.created_at - a.created_at); // Sort DESC
+    
+    // Check if limit query
+    if (normalizedText.includes('LIMIT 20')) {
+      return { rows: matchLogs.slice(0, 20) };
+    }
+    return { rows: matchLogs };
+  }
+
+  return { rows: [] };
+}
+
+/**
+ * Resolves database pool for user key.
  */
 function getTargetPool(key) {
+  if (useMock) return null;
   const targetNodeName = ring.getNode(key) || 'shard-1';
   return shardMap[targetNodeName];
 }
 
 /**
- * Executes a query on the correct shard resolved by the Consistent Hash Ring.
- * @param {string} routingKey - Key used to route the query
- * @param {string} text - SQL query template
- * @param {Array} params - SQL query arguments
+ * Route and execute query on SQL Shards, or fall back to Mock Engine.
  */
 async function queryRouted(routingKey, text, params) {
+  if (useMock) {
+    return queryMock(text, params);
+  }
+
   const targetPool = getTargetPool(routingKey);
   const targetNodeName = ring.getNode(routingKey) || 'shard-1';
   
@@ -46,9 +127,14 @@ async function queryRouted(routingKey, text, params) {
 }
 
 /**
- * Utility to run migrations/initialize tables on all database shards.
+ * Initializes SQL sharded schemas.
  */
 async function initializeShards() {
+  if (useMock) {
+    console.log('[DB Sharder] In-memory sharded tables ready.');
+    return;
+  }
+
   const tableInitQuery = `
     CREATE TABLE IF NOT EXISTS users (
       id VARCHAR(255) PRIMARY KEY,
