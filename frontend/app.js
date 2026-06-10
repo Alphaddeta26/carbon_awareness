@@ -1,4 +1,5 @@
-const API_BASE = 'http://localhost:5000/api';
+const API_BASE = window.location.protocol === 'file:' ? 'http://localhost:5000/api' : '/api';
+
 
 let token = localStorage.getItem('token') || null;
 let currentUser = JSON.parse(localStorage.getItem('user')) || null;

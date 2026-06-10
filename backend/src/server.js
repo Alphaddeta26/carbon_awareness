@@ -58,18 +58,28 @@ else {
   app.use('/api', leaderboardService);
   
   // Start Http listener and initialize DB tables
-  db.initializeShards().then(() => {
-    app.listen(PORT, () => {
-      console.log(`[Monolith] Web service listening on http://localhost:${PORT}`);
+  if (!process.env.VERCEL) {
+    db.initializeShards().then(() => {
+      app.listen(PORT, () => {
+        console.log(`[Monolith] Web service listening on http://localhost:${PORT}`);
+      });
     });
-  });
+  } else {
+    db.initializeShards();
+  }
 }
 
 // Helper to launch service HTTP listener
 function startHttpServer() {
-  db.initializeShards().then(() => {
-    app.listen(PORT, () => {
-      console.log(`[Service: ${SERVICE_TYPE}] Web service listening on http://localhost:${PORT}`);
+  if (!process.env.VERCEL) {
+    db.initializeShards().then(() => {
+      app.listen(PORT, () => {
+        console.log(`[Service: ${SERVICE_TYPE}] Web service listening on http://localhost:${PORT}`);
+      });
     });
-  });
+  } else {
+    db.initializeShards();
+  }
 }
+
+module.exports = app;
