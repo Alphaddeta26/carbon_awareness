@@ -1,111 +1,85 @@
-# Carbon Footprint Awareness Platform: System Design Document
+# Carbon Footprint Awareness Platform: Enterprise System Design
 
-This document details the system design, scalability features, caching architecture, database sharding strategies, security measures, and deployment blueprint for the scalable Carbon Footprint Awareness Platform.
+This document details the high-scale, event-driven microservices architecture designed to support millions of calculations, spiky write workloads, and dynamic database shard additions.
 
 ---
 
-## 1. System Architecture Overview
+## 1. System Architecture: Deconstructed Microservices
 
-The system uses a highly decoupled, service-oriented architecture designed to scale under heavy traffic workloads (millions of calculations and dashboard views per day).
+To handle scale, the monolithic Express app is deconstructed into specialized microservices. This allows independent scaling of memory/CPU resources based on the specific load profiles of each boundary context.
 
 ```
-[ Client Browsers ]
-         │
-         ▼  (HTTPS / WSS)
+[ Client Browser ]
+        │
+        ▼  (HTTPS)
 [ Nginx Reverse Proxy / Load Balancer ]
-         │
-         ├──────────────────────┬──────────────────────┐
-         ▼                      ▼                      ▼
-[ App Node 1 ]           [ App Node 2 ]          [ App Node 3 ]  (Express API Cluster)
-         │                      │                      │
-         ├──────────────────────┴──────────────────────┤
-         ├───► [ Redis Cluster ] (Sessions, Rate Limit, Leaderboard Sorted Sets)
-         │
-         ▼  (DB Router: MurmurHash3 modulo sharding)
-  ┌──────┴──────────────────────┐
-  ▼                             ▼
-[ PostgreSQL Shard A ]     [ PostgreSQL Shard B ]
+        │
+        ├──────────────────────┬──────────────────────┐
+        ▼                      ▼                      ▼
+ [ Auth Service ]      [ Ingestion Service ]  [ Leaderboard Service ]
+   (Auth Check)          (Spiky writes)         (High-speed reads)
+        │                      │                      │
+        │                      ▼                      ▼
+        │             [ Redis Stream Queue ]    [ Redis Cache ]
+        │                      │                      ▲
+        │                      ▼                      │ (ZSET Leaderboard)
+        │              [ Worker Service ] ────────────┘
+        │                      │
+        └──────────┬───────────┘
+                   ▼ (VNode Hash Ring)
+           ┌───────┴───────┐
+           ▼               ▼
+     [ DB Shard 1 ]  [ DB Shard 2 ]
 ```
 
-### Technology Stack
-- **Frontend**: Lightweight SPA (HTML5, Vanilla CSS3, Vanilla JS, SVG charting) served statically or by Node.
-- **Backend API**: Node.js & Express (Asynchronous, event-driven, single-threaded I/O loop).
-- **Cache / In-Memory DB**: Redis (In-memory storage for high-speed rate limiting, sessions, and leaderboard operations).
-- **Primary Database**: PostgreSQL cluster (Horizontal sharding for scale).
-- **Infrastructure**: Docker & Docker Compose (for complete local deployability and replication).
+### Microservice Definitions
+1. **Auth Service**: Manages user accounts, hashing passwords using `bcrypt`, and generating signed JSON Web Tokens (JWT).
+2. **Ingestion Service**: Exposes write endpoints. It validates calculator input payloads and pushes footprint logs onto a message queue. It returns a `202 Accepted` status immediately, completing requests in $<5\text{ms}$.
+3. **Worker Service**: A background daemon that pulls logs from the message queue, routes them to database shards, and syncs the Redis leaderboard.
+4. **Leaderboard Service**: Exposes public read endpoints to fetch the top 10 carbon champions directly from Redis.
 
 ---
 
-## 2. Database Sharding Strategy
+## 2. Consistent Hashing Ring with Virtual Nodes (VNodes)
 
-For a global platform tracking millions of carbon footprint entries, a single relational database instance becomes a write bottleneck. We implement a horizontal database sharding architecture.
+In standard modulo sharding ($Hash(key) \pmod N$), adding a new database shard invalidates almost all cached keys, forcing a massive, expensive data migration. We upgrade this to a **Consistent Hash Ring** with **Virtual Nodes (VNodes)**.
 
-### Partitioning Key Selection
-- **Key**: `user_id` (UUIDv4).
-- **Rationale**: Distributes reads and writes evenly across database shards. A hash function resolves queries for a specific user to a single database server, preventing cross-shard joins for core user footprint histories.
+### The Consistent Hash Ring
+- We map a 32-bit integer keyspace $[0, 2^{32}-1]$ onto a virtual circle (ring).
+- Both database shards and user keys are hashed onto this ring.
+- A key is routed to the first database shard encountered moving clockwise on the ring.
 
-### Sharding Router Algorithm
-We use **Consistent Hashing / Modulo Sharding** on the client connection driver level:
-1. Extract `user_id` from request token.
-2. Hash user ID using MD5 or MurmurHash3 to get a 32-bit integer.
-3. Compute `ShardIndex = Hash(user_id) % NumberOfShards`.
-4. Route SQL statement (Read/Write) to the database connection pool corresponding to `ShardIndex`.
+```
+          [ Shard 1 - VNode A ] (Hash: 100,000)
+                 /             \
+  [ User Key ]  /               \  [ Shard 2 - VNode A ] (Hash: 1,200,000)
+(Hash: 1,800,000)               /
+                \              /
+         [ Shard 1 - VNode B ] (Hash: 2,500,000)
+```
 
-### Database Schema per Shard
-Each database shard contains the tables:
-- `users`: User metadata, credentials, and regional info.
-- `footprints`: Calculated footprints (travel, energy, food, waste, calculated carbon output, and timestamp).
-
----
-
-## 3. Redis Caching & Operations Tier
-
-Redis is integrated as an in-memory database to optimize performance, handle real-time scoring, and protect backend servers.
-
-### A. API Rate Limiting (Sliding Window Algorithm)
-To prevent API abuse and DDoS attacks:
-- Key format: `rate_limit:{IP_ADDRESS}`.
-- Storage: Redis List containing Unix timestamps of recent API requests.
-- Logic:
-  1. On request, remove timestamps older than the rate limit window (e.g., 60 seconds) using `LTRIM`.
-  2. Query list length using `LLEN`.
-  3. If length exceeds max allowed limit (e.g., 100 requests/min), reject request with HTTP 429.
-  4. Otherwise, push current timestamp to list using `RPUSH` and set TTL of list using `EXPIRE`.
-
-### B. Global Carbon-Reduction Leaderboard (Sorted Sets)
-Fetching and sorting scores from multiple sharded databases is extremely slow. We utilize **Redis Sorted Sets (ZSET)**:
-- Key: `leaderboard:global`
-- Element: `username` or `user_id`
-- Score: `carbon_saved_kg` (amount of carbon reduction points accumulated)
-- Operations:
-  - Add/Update user score: `ZADD leaderboard:global {carbon_saved_kg} {username}`. Runs in $O(\log N)$ time.
-  - Fetch Top 10 users: `ZREVRANGE leaderboard:global 0 9 WITHSCORES`. Runs in $O(\log N + M)$ where $M$ is the number of elements requested (10). Extremely fast even with millions of users.
-
-### C. Session & Profile Cache (Cache-Aside Pattern)
-- Fetching user profiles:
-  - Try fetching from Redis key `user:profile:{user_id}`.
-  - On Cache Hit: Return user profile immediately (response time $<2\text{ms}$).
-  - On Cache Miss: Query the sharded PostgreSQL database, write results to Redis with a TTL of 1 hour, and return to client.
+### Virtual Nodes (VNodes)
+To prevent "hotspots" (uneven distribution of keys due to poor hash scattering), we introduce **Virtual Nodes**:
+- Instead of hashing a shard once, each physical shard is hashed multiple times (e.g., 100 VNodes per shard) using string suffixes: `shard-1#1`, `shard-1#2`, etc.
+- This interleaves physical databases across the ring, guaranteeing a highly uniform distribution of user keys.
+- **Dynamic Re-sharding**: When adding a physical Shard 3, we hash its VNodes onto the ring. Only a fraction ($1/N$) of existing keys are re-routed to Shard 3, leaving the remaining $83\%$ of data completely untouched.
 
 ---
 
-## 4. Security Architecture
+## 3. Asynchronous Write-Behind Queue
 
-1. **Authentication**: Stateless authentication using secure JSON Web Tokens (JWT) signed with a private HMAC-SHA256 key. Tokens expire in 24 hours.
-2. **Encryption**: Passwords hashed using `bcrypt` (10 rounds of salt) before storing in SQL shards.
-3. **Defense-in-depth Middlewares**:
-   - `helmet`: Sets HTTP response headers to secure against Clickjacking, XSS, and MIME sniffing.
-   - `cors`: Limits cross-origin access to trusted domains only.
-   - `express-validator`: Enforces strict type checking and sanitization on incoming JSON payloads to prevent SQL injection or XSS scripting attacks.
+Direct database writes during traffic spikes saturate connection pools. We decouple the ingestion service using a **Write-Behind Queue** backed by Redis Streams.
+
+### Operation Pipeline
+1. **Ingestion**: The user submits travel, energy, food, and waste values. The Ingestion Service pushes a task onto the queue using `LPUSH` or Redis Streams. It instantly returns a `202 Accepted` success response.
+2. **Buffering**: The queue buffers tasks, acting as a load-leveler during peaks.
+3. **Execution**: The Worker Service pulls tasks sequentially using `RPOPLPUSH` (guaranteeing reliable delivery), processes the carbon math, resolves the correct SQL shard, and saves the history log.
+4. **Rate Limiting**: IP-based rate limiting is implemented via Redis to prevent DDOS abuse.
 
 ---
 
-## 5. Deployment Blueprint (AWS Cloud)
+## 4. Production Cloud Infrastructure Blueprint (AWS)
 
-For production, the Docker services translate directly into AWS-managed components:
-
-1. **Routing**: Route53 handles DNS and forwards traffic to an **Application Load Balancer (ALB)**.
-2. **Compute**: Node.js containers run on **AWS ECS Fargate** (Serverless container runtime) with Auto-Scaling enabled based on CPU/Memory thresholds.
-3. **Caching**: Redis runs on **AWS ElastiCache (Redis)** configured with Multi-AZ replication and automatic failover.
-4. **Storage**: PostgreSQL database shards deploy on **AWS RDS PostgreSQL** (Multi-AZ) or **Aurora Serverless v2** instances, split across private subnets.
-5. **Secrets Management**: Credentials and token secrets are retrieved dynamically via **AWS Secrets Manager**.
+1. **ECS Fargate Clusters**: Run separate auto-scaling service groups for `auth`, `ingestion`, `leaderboard`, and `worker`.
+2. **Amazon MemoryDB / ElastiCache (Redis)**: High-performance caching and event stream queueing.
+3. **Amazon Aurora Serverless v2 PostgreSQL**: Multi-shard database cluster split into private subnets, using AWS Secrets Manager for credential rotation.
