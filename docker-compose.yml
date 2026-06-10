@@ -1,0 +1,71 @@
+version: '3.8'
+
+services:
+  # Node.js API server
+  app:
+    build: ./backend
+    container_name: carbon_app
+    ports:
+      - "5000:5000"
+    environment:
+      - PORT=5000
+      - JWT_SECRET=supersecret_carbon_key_2026
+      - REDIS_URL=redis://redis:6379
+      - DB_SHARD_1_URL=postgres://postgres:postgrespass@postgres-shard1:5432/carbon_shard1
+      - DB_SHARD_2_URL=postgres://postgres:postgrespass@postgres-shard2:5432/carbon_shard2
+    depends_on:
+      - redis
+      - postgres-shard1
+      - postgres-shard2
+    networks:
+      - carbon_network
+
+  # Redis Cache & Session Store
+  redis:
+    image: redis:7-alpine
+    container_name: carbon_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - carbon_network
+
+  # DB Shard 1
+  postgres-shard1:
+    image: postgres:15-alpine
+    container_name: carbon_db_shard1
+    ports:
+      - "5433:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgrespass
+      - POSTGRES_DB=carbon_shard1
+    volumes:
+      - shard1_data:/var/lib/postgresql/data
+    networks:
+      - carbon_network
+
+  # DB Shard 2
+  postgres-shard2:
+    image: postgres:15-alpine
+    container_name: carbon_db_shard2
+    ports:
+      - "5434:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgrespass
+      - POSTGRES_DB=carbon_shard2
+    volumes:
+      - shard2_data:/var/lib/postgresql/data
+    networks:
+      - carbon_network
+
+networks:
+  carbon_network:
+    driver: bridge
+
+volumes:
+  redis_data:
+  shard1_data:
+  shard2_data:
